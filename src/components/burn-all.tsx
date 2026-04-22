@@ -3,20 +3,83 @@
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { PublicKey, Transaction } from "@solana/web3.js";
+import type { Connection, AccountInfo } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
+  MintLayout,
   createBurnInstruction,
   createCloseAccountInstruction,
   AccountLayout,
 } from "@solana/spl-token";
 import { useCallback, useEffect, useState } from "react";
 
+const METADATA_PROGRAM_ID = new PublicKey(
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+);
+
 interface TokenAccount {
   pubkey: PublicKey;
   mint: PublicKey;
   amount: bigint;
   programId: PublicKey;
+  name?: string;
+  symbol?: string;
+  decimals: number;
+}
+
+function getMetadataPDA(mint: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("metadata"),
+      METADATA_PROGRAM_ID.toBuffer(),
+      mint.toBuffer(),
+    ],
+    METADATA_PROGRAM_ID
+  );
+  return pda;
+}
+
+function parseMetadata(data: Buffer): { name: string; symbol: string } {
+  let offset = 1 + 32 + 32; // key + update_authority + mint
+  const nameLen = data.readUInt32LE(offset);
+  offset += 4;
+  const name = data
+    .subarray(offset, offset + nameLen)
+    .toString("utf8")
+    .replace(/\0/g, "")
+    .trim();
+  offset += nameLen;
+  const symbolLen = data.readUInt32LE(offset);
+  offset += 4;
+  const symbol = data
+    .subarray(offset, offset + symbolLen)
+    .toString("utf8")
+    .replace(/\0/g, "")
+    .trim();
+  return { name, symbol };
+}
+
+function formatAmount(amount: bigint, decimals: number): string {
+  if (amount === 0n) return "0";
+  const str = amount.toString().padStart(decimals + 1, "0");
+  const intPart = str.slice(0, str.length - decimals) || "0";
+  if (decimals === 0) return intPart;
+  const decPart = str.slice(str.length - decimals).replace(/0+$/, "");
+  return decPart ? `${intPart}.${decPart}` : intPart;
+}
+
+async function batchFetch(
+  connection: Connection,
+  keys: PublicKey[]
+): Promise<(AccountInfo<Buffer> | null)[]> {
+  const results: (AccountInfo<Buffer> | null)[] = [];
+  for (let i = 0; i < keys.length; i += 100) {
+    const batch = keys.slice(i, i + 100);
+    const res = await connection.getMultipleAccountsInfo(batch);
+    results.push(...res);
+  }
+  return results;
 }
 
 export function BurnAll() {
@@ -64,7 +127,7 @@ export function BurnAll() {
     const parse = (
       items: typeof splAccounts.value,
       programId: PublicKey
-    ): TokenAccount[] =>
+    ) =>
       items.map((item) => {
         const data = AccountLayout.decode(item.account.data);
         return {
@@ -72,20 +135,66 @@ export function BurnAll() {
           mint: data.mint,
           amount: data.amount,
           programId,
+          decimals: 0,
         };
       });
 
-    const all = [
+    const all: TokenAccount[] = [
       ...parse(splAccounts.value, TOKEN_PROGRAM_ID),
       ...parse(token2022Accounts.value, TOKEN_2022_PROGRAM_ID),
     ];
 
-    setTokens(all);
-    setSelected(new Set(all.map((t) => t.pubkey.toString())));
+    if (all.length === 0) {
+      setStatus("No token accounts found.");
+      return;
+    }
+
+    // Fetch metadata + decimals
+    setStatus("Fetching metadata...");
+    const uniqueMints = [...new Set(all.map((t) => t.mint.toString()))];
+    const mintKeys = uniqueMints.map((m) => new PublicKey(m));
+    const metaPDAs = mintKeys.map(getMetadataPDA);
+
+    const [mintInfos, metaInfos] = await Promise.all([
+      batchFetch(connection, mintKeys),
+      batchFetch(connection, metaPDAs),
+    ]);
+
+    const decimalsMap = new Map<string, number>();
+    const metaMap = new Map<string, { name: string; symbol: string }>();
+
+    mintInfos.forEach((acc, i) => {
+      if (acc) {
+        const decoded = MintLayout.decode(acc.data);
+        decimalsMap.set(uniqueMints[i], decoded.decimals);
+      }
+    });
+
+    metaInfos.forEach((acc, i) => {
+      if (acc) {
+        try {
+          metaMap.set(uniqueMints[i], parseMetadata(acc.data as Buffer));
+        } catch {
+          // metadata parse failed, skip
+        }
+      }
+    });
+
+    const enriched = all.map((t) => {
+      const mintStr = t.mint.toString();
+      const meta = metaMap.get(mintStr);
+      return {
+        ...t,
+        decimals: decimalsMap.get(mintStr) ?? 0,
+        name: meta?.name,
+        symbol: meta?.symbol,
+      };
+    });
+
+    setTokens(enriched);
+    setSelected(new Set(enriched.map((t) => t.pubkey.toString())));
     setStatus(
-      all.length === 0
-        ? "No token accounts found."
-        : `${all.length} token account${all.length > 1 ? "s" : ""} found.`
+      `${enriched.length} token account${enriched.length > 1 ? "s" : ""} found.`
     );
   }, [publicKey, connection]);
 
@@ -104,34 +213,23 @@ export function BurnAll() {
 
       for (let i = 0; i < batches.length; i++) {
         const tx = new Transaction();
-
         for (const token of batches[i]) {
           if (token.amount > 0n) {
             tx.add(
               createBurnInstruction(
-                token.pubkey,
-                token.mint,
-                publicKey,
-                token.amount,
-                [],
-                token.programId
+                token.pubkey, token.mint, publicKey,
+                token.amount, [], token.programId
               )
             );
           }
           tx.add(
             createCloseAccountInstruction(
-              token.pubkey,
-              publicKey,
-              publicKey,
-              [],
-              token.programId
+              token.pubkey, publicKey, publicKey,
+              [], token.programId
             )
           );
         }
-
-        setStatus(
-          `Tx ${i + 1}/${batches.length} — approve in wallet...`
-        );
+        setStatus(`Tx ${i + 1}/${batches.length} — approve in wallet...`);
         const sig = await sendTransaction(tx, connection);
         setStatus(`Tx ${i + 1}/${batches.length} — confirming...`);
         await connection.confirmTransaction(sig, "confirmed");
@@ -158,12 +256,10 @@ export function BurnAll() {
 
   return (
     <div className="space-y-6">
-      {/* Connect */}
       <WalletMultiButton />
 
       {publicKey && (
         <>
-          {/* Scan button */}
           <button
             onClick={fetchTokens}
             disabled={loading}
@@ -190,31 +286,22 @@ export function BurnAll() {
             Scan token accounts
           </button>
 
-          {/* Token list */}
           {tokens.length > 0 && (
             <div className="space-y-3">
               <div
                 className="overflow-y-auto"
                 style={{
-                  maxHeight: 280,
+                  maxHeight: 320,
                   border: "1px solid var(--line)",
                   borderRadius: "var(--r-xl)",
                   background: "var(--surface)",
                 }}
               >
-                <table
-                  className="w-full"
-                  style={{ borderCollapse: "collapse" }}
-                >
+                <table className="w-full" style={{ borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ borderBottom: "1px solid var(--line)" }}>
-                      <th
-                        style={{ padding: "10px 12px", width: 36 }}
-                      >
-                        <Checkbox
-                          checked={allSelected}
-                          onChange={toggleAll}
-                        />
+                      <th style={{ padding: "10px 12px", width: 36 }}>
+                        <Checkbox checked={allSelected} onChange={toggleAll} />
                       </th>
                       <th
                         className="text-left font-normal font-mono"
@@ -225,7 +312,7 @@ export function BurnAll() {
                           color: "var(--muted)",
                         }}
                       >
-                        MINT
+                        TOKEN
                       </th>
                       <th
                         className="text-right font-normal font-mono"
@@ -241,63 +328,19 @@ export function BurnAll() {
                     </tr>
                   </thead>
                   <tbody>
-                    {tokens.map((t, idx) => {
-                      const key = t.pubkey.toString();
-                      const isSelected = selected.has(key);
-                      return (
-                        <tr
-                          key={key}
-                          onClick={() => toggleOne(key)}
-                          className="cursor-pointer"
-                          style={{
-                            borderBottom:
-                              idx < tokens.length - 1
-                                ? "1px solid var(--line)"
-                                : "none",
-                            background: isSelected
-                              ? "var(--surface-2)"
-                              : "transparent",
-                            transition: "background 120ms linear",
-                          }}
-                        >
-                          <td style={{ padding: "10px 12px", width: 36 }}>
-                            <Checkbox
-                              checked={isSelected}
-                              onChange={() => toggleOne(key)}
-                            />
-                          </td>
-                          <td
-                            className="font-mono"
-                            style={{
-                              padding: "10px 0",
-                              fontSize: 12,
-                              color: "var(--text)",
-                            }}
-                          >
-                            {t.mint.toString().slice(0, 12)}...
-                          </td>
-                          <td
-                            className="text-right font-mono"
-                            style={{
-                              padding: "10px 16px",
-                              fontSize: 12,
-                              color:
-                                t.amount > 0n
-                                  ? "var(--text-hi)"
-                                  : "var(--muted)",
-                              fontFeatureSettings: '"tnum"',
-                            }}
-                          >
-                            {t.amount.toString()}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    {tokens.map((t, idx) => (
+                      <TokenRow
+                        key={t.pubkey.toString()}
+                        token={t}
+                        isSelected={selected.has(t.pubkey.toString())}
+                        isLast={idx === tokens.length - 1}
+                        onToggle={() => toggleOne(t.pubkey.toString())}
+                      />
+                    ))}
                   </tbody>
                 </table>
               </div>
 
-              {/* Selection count */}
               <div
                 className="flex items-center justify-between font-mono"
                 style={{
@@ -326,7 +369,6 @@ export function BurnAll() {
                 </button>
               </div>
 
-              {/* Burn button */}
               <button
                 onClick={burnSelected}
                 disabled={loading || selected.size === 0}
@@ -336,8 +378,7 @@ export function BurnAll() {
                   borderRadius: "var(--r-lg)",
                   background: "var(--no-soft)",
                   color: "var(--no)",
-                  border:
-                    "1px solid color-mix(in oklch, var(--no) 25%, transparent)",
+                  border: "1px solid color-mix(in oklch, var(--no) 25%, transparent)",
                   fontFamily: "var(--font-sans)",
                   fontSize: 13,
                   fontWeight: 500,
@@ -364,7 +405,6 @@ export function BurnAll() {
         </>
       )}
 
-      {/* Status */}
       {status && (
         <p
           className="font-mono text-center"
@@ -382,6 +422,72 @@ export function BurnAll() {
         </p>
       )}
     </div>
+  );
+}
+
+function TokenRow({
+  token,
+  isSelected,
+  isLast,
+  onToggle,
+}: {
+  token: TokenAccount;
+  isSelected: boolean;
+  isLast: boolean;
+  onToggle: () => void;
+}) {
+  const hasName = Boolean(token.symbol || token.name);
+  return (
+    <tr
+      onClick={onToggle}
+      className="cursor-pointer"
+      style={{
+        borderBottom: isLast ? "none" : "1px solid var(--line)",
+        background: isSelected ? "var(--surface-2)" : "transparent",
+        transition: "background 120ms linear",
+      }}
+    >
+      <td style={{ padding: "10px 12px", width: 36 }}>
+        <Checkbox checked={isSelected} onChange={onToggle} />
+      </td>
+      <td style={{ padding: "10px 0" }}>
+        {hasName ? (
+          <div>
+            <span style={{ fontSize: 13, color: "var(--text-hi)" }}>
+              {token.symbol || token.name}
+            </span>
+            <span
+              className="font-mono"
+              style={{
+                fontSize: 10,
+                color: "var(--muted)",
+                marginLeft: 8,
+              }}
+            >
+              {token.mint.toString().slice(0, 8)}...
+            </span>
+          </div>
+        ) : (
+          <span
+            className="font-mono"
+            style={{ fontSize: 12, color: "var(--text)" }}
+          >
+            {token.mint.toString().slice(0, 12)}...
+          </span>
+        )}
+      </td>
+      <td
+        className="text-right font-mono"
+        style={{
+          padding: "10px 16px",
+          fontSize: 12,
+          color: token.amount > 0n ? "var(--text-hi)" : "var(--muted)",
+          fontFeatureSettings: '"tnum"',
+        }}
+      >
+        {formatAmount(token.amount, token.decimals)}
+      </td>
+    </tr>
   );
 }
 
@@ -409,13 +515,7 @@ function Checkbox({
       }}
     >
       {checked && (
-        <svg
-          width="8"
-          height="8"
-          viewBox="0 0 8 8"
-          fill="none"
-          style={{ display: "block" }}
-        >
+        <svg width="8" height="8" viewBox="0 0 8 8" fill="none" style={{ display: "block" }}>
           <path
             d="M1.5 4L3.2 5.7L6.5 2.3"
             stroke="var(--bg)"
