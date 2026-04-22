@@ -69,6 +69,24 @@ function formatAmount(amount: bigint, decimals: number): string {
   return decPart ? `${intPart}.${decPart}` : intPart;
 }
 
+async function pollConfirmation(
+  connection: Connection,
+  signature: string,
+  timeout = 60000
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { value } = await connection.getSignatureStatuses([signature]);
+    const status = value[0];
+    if (status) {
+      if (status.err) throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
+      if (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized") return;
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error("Transaction confirmation timeout");
+}
+
 async function batchFetch(
   connection: Connection,
   keys: PublicKey[]
@@ -232,7 +250,7 @@ export function BurnAll() {
         setStatus(`Tx ${i + 1}/${batches.length} — approve in wallet...`);
         const sig = await sendTransaction(tx, connection);
         setStatus(`Tx ${i + 1}/${batches.length} — confirming...`);
-        await connection.confirmTransaction(sig, "confirmed");
+        await pollConfirmation(connection, sig);
       }
 
       setStatus(

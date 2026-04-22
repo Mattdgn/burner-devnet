@@ -9,8 +9,10 @@ import "@solana/wallet-adapter-react-ui/styles.css";
 export function Providers({ children }: { children: React.ReactNode }) {
   const endpoint = useMemo(() => clusterApiUrl("devnet"), []);
 
+  const config = useMemo(() => ({ wsEndpoint: "", commitment: "confirmed" as const }), []);
+
   return (
-    <ConnectionProvider endpoint={endpoint}>
+    <ConnectionProvider endpoint={endpoint} config={config}>
       <WalletProvider wallets={[]} autoConnect>
         <WalletModalProvider>{children}</WalletModalProvider>
       </WalletProvider>
